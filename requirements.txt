@@ -1,0 +1,5 @@
+gradio==5.23.1
+llama_index==0.12.26
+llama-index-llms-ollama==0.5.4
+llama-index-llms-openai==0.3.28
+python-dotenv==1.1.0

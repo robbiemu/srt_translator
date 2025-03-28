@@ -86,38 +86,28 @@ class SRTTranslator:
             content: str,
             context: Optional[Tuple[int, List[str]]] = None
         ) -> str:
-            """
-            Translate subtitle text with optional context.
-            
-            Args:
-                content: Text to translate
-                context: Tuple of (window_size, context_lines)
-                
-            Returns:
-                Translated text with preserved formatting
-            """
             try:
                 window_size, context_lines = context or (0, [])
                 
-                # Validate input before processing
                 if not content.strip():
                     logger.warning("Empty content passed to translation tool")
                     return ""
                 
-                # Preserve any formatting markers (like italics)
+                # Preserve formatting tags
                 formatting_tags = self._extract_formatting_tags(content)
                 
+                # Get and clean response
                 prompt = self._build_translation_prompt(content, window_size, context_lines)
-                response = self.llm.complete(prompt).text.strip()
+                raw_response = self.llm.complete(prompt).text.strip()
+                response = self._sanitize_response(raw_response)
                 
-                # Restore formatting tags if they were removed during translation
+                # Restore formatting and validate (original unchanged validation)
                 if formatting_tags:
                     response = self._restore_formatting_tags(response, formatting_tags)
-                
-                # Validate basic subtitle constraints
                 self._validate_subtitle_length(response)
                 
                 return response
+                
             except Exception as e:
                 logger.error(f"Translation failed for content: {content[:50]}... Error: {str(e)}")
                 raise
@@ -125,59 +115,75 @@ class SRTTranslator:
         return translate
 
     def _create_validation_tool(self):
-        """Create a direct validation tool method."""
-        def validate(
-            original: str,
-            translation: str,
-            context: Optional[Tuple[int, List[str]]] = None
-        ) -> Tuple[bool, str]:
-            """
-            Validate translation quality and subtitle constraints.
-            
-            Returns:
-                Tuple of (is_valid, feedback_message)
-            """
-            try:
-                window_size, context_lines = context or (0, [])
-                
-                # Basic validation checks
-                if not translation.strip():
-                    return False, "Empty translation"
+            """Create a direct validation tool method."""
+            def validate(
+                original: str,
+                translation: str,
+                context: Optional[Tuple[int, List[str]]] = None
+            ) -> Tuple[bool, str]:
+                """
+                Validate translation quality and subtitle constraints.
+                Returns:
+                    Tuple of (is_valid, feedback_message)
+                """
+                try:
+                    window_size, context_lines = context or (0, [])
                     
-                if len(translation) > len(original) * 1.5:
-                    return False, "Translation too long compared to original"
-                
-                # LLM-based validation
-                validation_result = self._llm_validation(original, translation, window_size, context_lines)
-                
-                # Additional technical checks
-                line_breaks = translation.count('\n')
-                if line_breaks > self.MAX_LINES_PER_SUBTITLE:
-                    validation_result = (
-                        False,
-                        f"{validation_result[1]} | Too many lines ({line_breaks})"
-                    )
-                
-                return validation_result
-            except Exception as e:
-                logger.error(f"Validation failed for translation: {translation[:50]}... Error: {str(e)}")
-                return False, f"Validation error: {str(e)}"
+                    # Basic validation checks
+                    if not translation.strip():
+                        return False, "Empty translation"
+                        
+                    if len(translation) > len(original) * 1.5:
+                        return False, "Translation too long compared to original"
+                    
+                    # LLM-based validation
+                    validation_result = self._llm_validation(original, translation, window_size, context_lines)
+                    
+                    # Additional technical checks
+                    line_breaks = translation.count('\n')
+                    if line_breaks > self.MAX_LINES_PER_SUBTITLE:
+                        validation_result = (
+                            False,
+                            f"{validation_result[1]} | Too many lines ({line_breaks})\nTRANSLATION: {translation}"
+                        )
+                    
+                    # Log INFO for VALID, handle return for UI
+                    if validation_result[0]:  # If valid
+                        logger.info(f"Validation of Translation: {validation_result[1]}")
+                    else:
+                        logger.warning(f"Validation of Translation: {validation_result[1]}\nTRANSLATION: {translation}")
+                    
+                    return validation_result
+                except Exception as e:
+                    logger.error(f"Validation failed for translation: {translation[:50]}... Error: {str(e)}")
+                    return False, f"Validation error: {str(e)}"
 
-        return validate
+            return validate
 
     def _build_translation_prompt(self, content: str, window_size: int, context_lines: List[str]) -> str:
-        """Construct the translation prompt with context and guidelines."""
         return (
-            f"Translate this subtitle to {self.target_language} while following these rules:\n"
-            f"1. Preserve all formatting (italics, etc.)\n"
-            f"2. Keep timing constraints in mind (be concise)\n"
-            f"3. Maintain consistency with context\n\n"
+            f"Translate ONLY the text between ### markers to {self.target_language}. "
+            f"PRESERVE EXACT FORMATTING. NEVER add explanations or context notes.\n\n"
             f"Tone Guidelines:\n{self._format_guidelines()}\n\n"
-            f"Current Text:\n{content}\n\n"
+            f"###\n{content}\n###\n\n"
             f"Context Window: {window_size} lines\n"
             f"Context Content:\n{'- '.join(context_lines) if context_lines else 'None'}\n\n"
-            f"Provide only the translation without explanations."
+            f"Respond ONLY with the translated text between ### markers. Do not use formatting markers to encapsulate your response."
         )
+    
+    def _sanitize_response(self, response: str) -> str:
+        """Clean LLM response while preserving original validation checks"""
+        # Extract content between ### markers if present
+        if "###" in response:
+            parts = response.split("###")
+            if len(parts) >= 3:
+                response = parts[1].strip()
+        
+        # Remove any trailing metadata
+        response = response.split("Context Window:")[0].strip()
+        response = response.split("Note:")[0].strip()
+        
+        return response
 
     def _format_guidelines(self) -> str:
         """Format tone guidelines for prompt inclusion."""
@@ -196,17 +202,18 @@ class SRTTranslator:
             f"2. Natural flow in target language\n"
             f"3. Consistency with context\n"
             f"4. Adherence to tone guidelines\n\n"
-            f"Respond with:\n"
-            f"VALID: <feedback> - if translation meets all criteria\n"
-            f"ISSUES: <feedback> - if any issues found\n"
-            f"Provide specific, actionable feedback."
+            f"The first word of your response must be one of:\n"
+            f"VALID - if translation meets all criteria\n"
+            f"ISSUES - if any issues found\n"
+            f"Then provide specific, actionable feedback.\n\n"
+            f"Note: Do not begin with ANY OTHER word or phrase, the very first word must be either VALID or ISSUES"
         )
         
         response = self.llm.complete(prompt).text.strip()
         
-        if response.startswith('VALID:'):
+        if response.startswith('VALID'):
             return True, response[6:].strip()
-        return False, response[8:].strip() if response.startswith('ISSUES:') else response
+        return False, response[8:].strip() if response.startswith('ISSUES') else response
 
     def parse_srt(self, file_path: Path) -> List[Dict]:
         """Parse SRT file into structured entries with validation."""
@@ -279,7 +286,7 @@ class SRTTranslator:
             if len(line) > self.MAX_SUBTITLE_LENGTH:
                 logger.warning(f"Subtitle line exceeds recommended length: {len(line)} characters")
         if len(lines) > self.MAX_LINES_PER_SUBTITLE:
-            logger.warning(f"Subtitle exceeds recommended line count: {len(lines)} lines")
+            logger.warning(f"Subtitle exceeds recommended line count: {len(lines)} lines ({text})")
 
     def _get_context(self, entries: List[Dict], idx: int, window: int) -> List[str]:
         """Get context lines around given index with boundary checks."""

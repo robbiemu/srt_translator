@@ -1,31 +1,33 @@
 import gradio as gr
 from pathlib import Path
-from srt_translator import SRTTranslator
 from llama_index.llms.openai import OpenAI
-from llama_index.llms.ollama import Ollama  
+from llama_index.llms.ollama import Ollama
 import os
-import tempfile
+import time
 from dotenv import load_dotenv
 import logging
+
+from srt_translator import SRTTranslator 
 
 
 load_dotenv()
 
-# Set up logging to capture warnings
+# Set up logging
 logging.basicConfig()
-logger = logging.getLogger('srt_translator')
+logger = logging.getLogger("srt_translator")
 
 
 def create_translator(
-    target_language: str = "es", 
-    style_guideline: str = "Natural speech patterns", 
-    technical_guideline: str = "Use standard terminology"
-):    
+    target_language: str = "es",
+    style_guideline: str = "Natural speech patterns",
+    technical_guideline: str = "Use standard terminology",
+):
+    # --- LLM Setup ---
     MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "openai")
     MODEL_NAME = os.getenv("MODEL_NAME")
     MODEL_PARAM_TEMPERATURE = os.getenv("OPENAI_TEMPERATURE", "0.3")
     MODEL_PROVIDER_URL = os.getenv("MODEL_PROVIDER_URL", "http://localhost:11434")
-    
+
     if MODEL_PROVIDER == "openai":
         OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
         if not OPENAI_API_KEY:
@@ -34,44 +36,45 @@ def create_translator(
         llm = OpenAI(
             model=os.getenv("OPENAI_MODEL", MODEL_NAME),
             temperature=float(MODEL_PARAM_TEMPERATURE),
-            api_key=OPENAI_API_KEY
+            api_key=OPENAI_API_KEY,
         )
     elif MODEL_PROVIDER == "ollama":
         OLLAMA_PARAM_TOP_P = os.getenv("OLLAMA_PARAM_TOP_P", "0.9")
-        OLLAMA_PARAM_NUM_CTX = os.getenv("OLLAMA_PARAM_NUM_CTX", "4096")
+        OLLAMA_PARAM_NUM_CTX = os.getenv("OLLAMA_PARAM_NUM_CTX", "4096") 
         OLLAMA_PARAM_NUM_PREDICT = os.getenv("OLLAMA_PARAM_NUM_PREDICT", "1024")
 
-        llm = Ollama( 
+        llm = Ollama(
             model=os.getenv("OLLAMA_MODEL", MODEL_NAME),
-            base_url=os.getenv("OLLAMA_BASE_URL", MODEL_PROVIDER_URL), 
+            base_url=os.getenv("OLLAMA_BASE_URL", MODEL_PROVIDER_URL),
             temperature=float(MODEL_PARAM_TEMPERATURE),
             top_p=float(OLLAMA_PARAM_TOP_P),
             num_ctx=int(OLLAMA_PARAM_NUM_CTX),
-            num_predict=int(OLLAMA_PARAM_NUM_PREDICT)
+            num_predict=int(OLLAMA_PARAM_NUM_PREDICT),
         )
     else:
         raise ValueError("Invalid model provider")
-    
+
+    # --- SRTTranslator Initialization ---
     return SRTTranslator(
         llm=llm,
         target_language=target_language,
         tone_guidelines={
-            'style': style_guideline,
-            'technical': technical_guideline
-        }
+            "style": style_guideline,
+            "technical": technical_guideline,
+        },
     )
 
 
 def format_warning(warning):
     """Formats a single warning/error with proper structure"""
-    if warning['type'] == 'error':
+    if warning["type"] == "error":
         return (
             f"\n❌ ENTRY {warning['entry']} ERROR: {warning['message']}\n"
             f"ORIGINAL TEXT:\n{warning['original']}\n"
             f"TRANSLATION: [FAILED]\n"
             "────────────────────"
         )
-    else:
+    else: # Assuming 'validation' type
         return (
             f"\n⚠️ ENTRY {warning['entry']} WARNING: {warning['message']}\n"
             f"ORIGINAL TEXT:\n{warning['original']}\n"
@@ -80,52 +83,54 @@ def format_warning(warning):
         )
 
 
-def translate_srt_file(srt_file, target_language, style_guideline, technical_guideline):
+def get_persistent_temp_dir():
+    """Returns a persistent temp directory path that won't be automatically cleaned up"""
+    temp_base = os.getenv("GRADIO_TEMP_DIR", "/tmp/srt_translator")
+    os.makedirs(temp_base, exist_ok=True)
+    return temp_base
+
+
+def translate_srt_file(srt_file, target_language, style_guideline, technical_guideline, progress=gr.Progress()):
+    temp_dir = None
     try:
-        # Save uploaded file
-        temp_dir = tempfile.mkdtemp()
+        temp_dir = os.path.join(get_persistent_temp_dir(), f"tmp{os.urandom(4).hex()}")
+        os.makedirs(temp_dir, exist_ok=True)
+
         input_path = Path(temp_dir) / "input.srt"
         output_path = Path(temp_dir) / "output.srt"
-        
+
         with open(input_path, "wb") as f:
             f.write(srt_file)
 
-        # Setup translator and parse
         translator = create_translator(
             target_language=target_language,
             style_guideline=style_guideline,
             technical_guideline=technical_guideline
         )
         entries = translator.parse_srt(input_path)
-        
-        # Initialize streaming output
+        total_entries = len(entries)
+
         warning_message = "Starting translation...\n"
-        yield None, warning_message, 0  # Initialize progress to 0
-        
-        for i, entry in enumerate(entries):
-            # Calculate progress
-            progress = (i + 1) / len(entries)
-            
+        progress_desc = "Initializing..."
+        yield None, warning_message
+
+        for i, entry in enumerate(entries, 1):
+            progress_desc = f"Translating: {i}/{total_entries} entries ({int((i/total_entries)*100)}%)"
+            progress(i / total_entries)
+            current_warning_update = None
+
             try:
-                # Get context (simplified for example)
-                context = (2, [
-                    entries[max(0,i-1)]['text'],
-                    entries[min(len(entries)-1,i+1)]['text']
-                ])
-                
-                # Translate
-                entry['translation'] = translator.translation_tool(
-                    entry['text'],
-                    context=context
+                context = (
+                    2,  # Context window size
+                    [
+                        entries[max(0, i-1)]['text'],
+                        entries[min(total_entries-1, i+1)]['text']
+                    ]
                 )
-                
-                # Validate
-                is_valid, feedback = translator.validation_tool(
-                    entry['text'],
-                    entry['translation'],
-                    context=context
-                )
-                
+
+                entry['translation'] = translator.translation_tool(entry['text'], context=context)
+                is_valid, feedback = translator.validation_tool(entry['text'], entry['translation'], context=context)
+
                 if not is_valid:
                     warning = {
                         'entry': entry['number'],
@@ -136,11 +141,8 @@ def translate_srt_file(srt_file, target_language, style_guideline, technical_gui
                     }
                     formatted = format_warning(warning)
                     warning_message += formatted
-                    yield None, warning_message, progress
-                else:
-                    # Only yield progress if no warning
-                    yield None, warning_message, progress
-                    
+                    current_warning_update = warning_message
+
             except Exception as e:
                 error = {
                     'entry': entry['number'],
@@ -151,22 +153,35 @@ def translate_srt_file(srt_file, target_language, style_guideline, technical_gui
                 }
                 formatted = format_warning(error)
                 warning_message += formatted
-                yield None, warning_message, progress  # Yield progress even on error
-                continue
+                entry['translation'] = f"[ERROR] {entry['text']}"
+                current_warning_update = warning_message
 
-        # Final save
+            yield None, current_warning_update if current_warning_update else gr.update()
+
         with open(output_path, 'w', encoding='utf-8') as f:
             for entry in entries:
                 f.write(f"{entry['number']}\n")
                 f.write(f"{entry['timecode']}\n")
                 f.write(f"{entry.get('translation', entry['text'])}\n\n")
-        
-        # Final output
+
+        # Final output with caching consideration
         warning_message += "\n\n✅ Translation complete!"
-        yield str(output_path), warning_message, 1  # Final progress: 100%
+        progress_desc = "Translation complete!"
         
+        yield str(output_path), warning_message
+        if os.getenv("GRADIO_CACHING_EXAMPLES"): # For caching, keep files around and let Gradio handle them
+            time.sleep(2)  # Give Gradio time to cache
+
     except Exception as e:
         raise gr.Error(f"Translation failed: {str(e)}")
+    finally:
+        if not os.getenv("GRADIO_CACHING_EXAMPLES") and temp_dir and os.path.exists(temp_dir):
+            try:
+                import shutil
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as cleanup_error:
+                logger.error(f"Failed to cleanup {temp_dir}: {cleanup_error}")
 
 
 # Gradio interface
@@ -175,8 +190,9 @@ with gr.Blocks(title="SRT File Translator") as demo:
     # SRT File Translator
     Upload an SRT subtitle file and customize your translation.
     """)
-    
+
     with gr.Row():
+        # --- Input Column ---
         with gr.Column():
             file_input = gr.File(label="Upload SRT File", type="binary")
             language_dropdown = gr.Dropdown(
@@ -185,38 +201,40 @@ with gr.Blocks(title="SRT File Translator") as demo:
                 value="es"
             )
             style_guideline = gr.Textbox(
-                label="Style Guideline", 
+                label="Style Guideline",
                 value="Natural speech patterns",
                 placeholder="E.g., Conversational, Formal, Casual"
             )
             technical_guideline = gr.Textbox(
-                label="Technical Guideline", 
+                label="Technical Guideline",
                 value="Use standard terminology",
                 placeholder="E.g., Use industry-specific terms, Localize technical language"
             )
             submit_btn = gr.Button("Translate", variant="primary")
-        
+
+        # --- Output Column ---
         with gr.Column():
             file_output = gr.File(label="Translated SRT File")
             warnings_output = gr.Textbox(label="Translation Warnings", interactive=False)
-            progress_bar = gr.Slider(label="Translation Progress", minimum=0, maximum=1, step=0.01, interactive=False)  # Add progress bar
 
-    
+    # *** Click handler outputs ***
     submit_btn.click(
         fn=translate_srt_file,
         inputs=[file_input, language_dropdown, style_guideline, technical_guideline],
-        outputs=[file_output, warnings_output, progress_bar]  # Add progress bar to outputs
+        outputs=[file_output, warnings_output],  
+        show_progress_on=[file_output]
     )
-    
+
+    # *** Examples outputs ***
     gr.Examples(
         examples=[
             ["example.srt", "es", "Natural speech patterns", "Use standard terminology"],
-            ["example.srt", "fr", "Formal and elegant", "Precise technical translations"]
+            ["example.srt", "fr", "Formal and elegant", "Precise technical translations"],
         ],
         inputs=[file_input, language_dropdown, style_guideline, technical_guideline],
-        outputs=[file_output, warnings_output, progress_bar],
+        outputs=[file_output, warnings_output],
         fn=translate_srt_file,
-        cache_examples=True
+        cache_examples=True,
     )
 
 

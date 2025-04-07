@@ -20,15 +20,18 @@ COPY .env* ./
 COPY example.srt ./
 COPY src/ .
 
-
-# Create directory for temporary files
-RUN mkdir -p /tmp/srt_translator
+# Create persistent directories with proper permissions
+RUN mkdir -p /app/persistent_temp /app/.gradio && \
+    chmod -R 777 /app/persistent_temp && \
+    chmod -R 777 /app/.gradio
 
 # Default Environment variables
 ENV OPENAI_MODEL="gpt-4"
 ENV TARGET_LANGUAGE="es"
 ENV STYLE_GUIDELINE="Natural speech patterns"
 ENV TECHNICAL_GUIDELINE="Use standard terminology"
+ENV GRADIO_TEMP_DIR="/app/persistent_temp"
+ENV GRADIO_CACHING_EXAMPLES="True"
 
 # Expose port
 EXPOSE 7860
